@@ -1,0 +1,2 @@
+[lerobot.robots]
+rerun_robot = lerobot_robot_rerun:RerunRobotConfig
