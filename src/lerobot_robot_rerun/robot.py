@@ -14,6 +14,23 @@ from .config import RerunRobotConfig
 
 logger = logging.getLogger(__name__)
 
+# RerunRobot accepts normalized [-100, +100] (same as physical robots like SO101)
+# and maps to radians internally using URDF joint limits.
+try:
+    from lerobot_action_space.modes import ActionMode
+    RERUN_ROBOT_MODES: list[ActionMode] = [
+        ActionMode(
+            name="joint_absolute_norm",
+            space_type="joint",
+            unit="normalized",
+            command_mode="absolute",
+            description="Joint positions in normalized [-100, +100] range (mapped to rad via URDF limits)",
+            is_default=True,
+        )
+    ]
+except ImportError:
+    RERUN_ROBOT_MODES = []
+
 # Link colours by common name fragments (RGB 0-255)
 _LINK_COLORS: list[tuple[str, list[int]]] = [
     ("base",    [50,  50,  65 ]),
@@ -78,12 +95,18 @@ class RerunRobot(Robot):
         self._robot: yourdfpy.URDF | None = None
         self._node_to_link: dict[str, str] = {}
         self._joint_names: list[str] = []
-        self._joint_state: dict[str, float] = {}
+        self._joint_state: dict[str, float] = {}  # in radians
+        self._joint_limits: dict[str, tuple[float, float]] = {}  # (lo_rad, hi_rad)
         self._is_connected = False
 
     @property
     def is_connected(self) -> bool:
         return self._is_connected
+
+    @property
+    def robot_modes(self):
+        """Action modes this robot accepts (joint_absolute_rad)."""
+        return RERUN_ROBOT_MODES
 
     @property
     def is_calibrated(self) -> bool:
@@ -111,10 +134,15 @@ class RerunRobot(Robot):
         self._robot = yourdfpy.URDF.load(str(urdf_path), mesh_dir=str(mesh_dir))
         self._node_to_link = _build_node_to_link(self._robot)
 
-        # Determine joint names
-        all_joints = [j.name for j in self._robot.robot.joints if j.type != "fixed"]
-        self._joint_names = self.config.joint_names if self.config.joint_names else all_joints
+        # Determine joint names and limits
+        all_joints = [j for j in self._robot.robot.joints if j.type != "fixed"]
+        names = self.config.joint_names if self.config.joint_names else [j.name for j in all_joints]
+        self._joint_names = names
         self._joint_state = {j: 0.0 for j in self._joint_names}
+        self._joint_limits = {}
+        for j in all_joints:
+            if j.name in self._joint_names and j.limit:
+                self._joint_limits[j.name] = (j.limit.lower, j.limit.upper)
 
         # Init rerun
         rr.init(self.config.rerun_app_id, spawn=self.config.spawn_viewer)
@@ -138,7 +166,7 @@ class RerunRobot(Robot):
     def get_observation(self) -> dict:
         if not self._is_connected:
             raise DeviceNotConnectedError(f"{self} not connected")
-        return {f"{j}.pos": self._joint_state[j] for j in self._joint_names}
+        return {f"{j}.pos": self._norm(j) for j in self._joint_names}
 
     def send_action(self, action: dict) -> dict:
         if not self._is_connected:
@@ -147,10 +175,29 @@ class RerunRobot(Robot):
         for j in self._joint_names:
             key = f"{j}.pos"
             if key in action:
-                self._joint_state[j] = float(action[key])
+                norm = float(action[key])
+                # Convert normalized [-100, +100] → radians via joint limits
+                if j in self._joint_limits:
+                    lo, hi = self._joint_limits[j]
+                    mid = (hi + lo) / 2
+                    amp = (hi - lo) / 2
+                    self._joint_state[j] = mid + (norm / 100.0) * amp
+                else:
+                    self._joint_state[j] = norm  # fallback: no limits known
 
         self._log_transforms()
-        return {f"{j}.pos": self._joint_state[j] for j in self._joint_names}
+        # Return normalized (matches input convention)
+        return {f"{j}.pos": self._norm(j) for j in self._joint_names}
+
+    def _norm(self, joint: str) -> float:
+        """Convert internal rad state back to normalized [-100, +100]."""
+        rad = self._joint_state[joint]
+        if joint in self._joint_limits:
+            lo, hi = self._joint_limits[joint]
+            mid = (hi + lo) / 2
+            amp = (hi - lo) / 2
+            return (rad - mid) / amp * 100.0 if amp else 0.0
+        return rad
 
     def disconnect(self) -> None:
         if not self._is_connected:
